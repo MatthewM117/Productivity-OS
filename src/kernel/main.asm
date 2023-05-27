@@ -1,10 +1,16 @@
-org 0x7C00
+org 0x0
 bits 16
 
 %define ENDLINE 0x0D, 0x0A
 
 start:
-    jmp main
+    ; print message to screen
+    mov si, new_message
+    call puts
+
+.halt:
+    cli
+    hlt
 
 ;----------
 ; prints a string to the screen
@@ -13,6 +19,7 @@ start:
 puts:
     push si
     push ax
+    push bx
 
 .loop:
     lodsb
@@ -27,30 +34,9 @@ puts:
 
 
 .done:
+    pop bx
     pop ax
     pop si
     ret
 
-main:
-    ; cannot write to ds and es directly
-    mov ax, 0
-    mov ds, ax
-    mov es, ax
-
-    ; setup stack that will grow down from loaded memory location as not to overwrite our program
-    mov ss, ax
-    mov sp, 0x7C00
-
-    ; print message to screen
-    mov si, new_message
-    call puts
-
-    hlt
-
-.halt:
-    jmp .halt
-
-new_message: db 'Hello, world!', ENDLINE, 0
-
-times 510-($-$$) db 0
-dw 0AA55h
+new_message: db 'Hello, world from kernel!', ENDLINE, 0

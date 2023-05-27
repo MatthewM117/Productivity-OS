@@ -30,7 +30,174 @@ ebr_volume_label:          db 'MATTHEW  OS' ; can be anything, but make sure its
 ebr_system_id:             db 'FAT12   ' ; 8 bytes, padded with spaces
 
 start:
-    jmp main
+    ; cannot write to ds and es directly
+    mov ax, 0
+    mov ds, ax
+    mov es, ax
+
+    ; setup stack that will grow down from loaded memory location as not to overwrite our program
+    mov ss, ax
+    mov sp, 0x7C00
+
+    ; some bioses may start at 07c0:0000 instead of 0000:7c00
+    push es
+    push word .after
+    retf
+
+.after:
+    ; read something from floppy disk (bios should set dl to drive number)
+    mov [ebr_drive_number], dl
+    
+    mov si, loading_message
+    call puts
+
+    ; reading drive parameters
+    push es
+    mov ah, 08h
+    int 13h
+    jc floppy_error
+    pop es
+
+    and cl, 0x3F ; remove top 2 bits
+    xor ch, ch
+    mov [bdb_sectors_per_track], cx
+
+    inc dh
+    mov [bdb_heads], dh
+
+    ; lba/root directory = reserved + fats * sectors per fat
+    mov ax, [bdb_sectors_per_fat] 
+    mov bl, [bdb_fat_count]
+    xor bh, bh
+    mul bx ; ax = (fats * sectors per fat)
+    add ax, [bdb_reserved_sectors] ; ax = lba of root directory
+    push ax
+
+    ; computing size of root directory = (32 * num of entries) / bytes per sector
+    mov ax, [bdb_dir_entries_count]
+    shl ax, 5 ; ax *= 32
+    xor dx, dx
+    div word [bdb_bytes_per_sector] ; num of sectors needed to be read
+
+    test dx, dx ; if dx != 0, add 1
+    jz .root_dir_after
+    inc ax ; remained != 0, add 1
+
+.root_dir_after:
+    mov cl, al ; cl = num of sectors to read
+    pop ax ; lba of root dir
+    mov dl, [ebr_drive_number]
+    mov bx, buffer
+    call read_sectors
+
+    ; search for kernel.bin
+    xor bx, bx
+    mov di, buffer
+
+.search_kernel:
+    mov si, file_kernel_bin
+    mov cx, 11 ; length of file_kernel_bin name
+    push di
+    repe cmpsb
+    pop di
+    je .found_kernel
+
+    add di, 32
+    inc bx
+    cmp bx, [bdb_dir_entries_count]
+    jl .search_kernel
+
+    jmp kernel_not_found_error
+
+.found_kernel:
+    mov ax, [di + 26] ; first logical cluster field. offset = 26
+    mov [kernel_cluster], ax
+
+    ; load fat from disk into memory
+    mov ax, [bdb_reserved_sectors]
+    mov bx, buffer
+    mov cl, [bdb_sectors_per_fat]
+    mov dl, [ebr_drive_number]
+    call read_sectors
+
+    ; read kernel and process fat chain
+    mov bx, KERNEL_LOAD_SEGMENT
+    mov es, bx
+    mov bx, KERNEL_LOAD_OFFSET
+
+.load_kernel_loop:
+    ; reading next sector
+    mov ax, [kernel_cluster]
+    ; first cluster = (kernel_cluster - 2) * sectors per cluster + start sector
+    ; start sector = reserved + fats + root dir size = 1 + 18 + 134 = 33
+    add ax, 31 ; change this hardcoded value later
+
+    mov cl, 1
+    mov dl, [ebr_drive_number]
+    call read_sectors
+
+    add bx, [bdb_bytes_per_sector] ; will overflow if kernel.bin file is >64kb
+
+    ; calculate next cluster location
+    mov ax, [kernel_cluster]
+    mov cx, 3
+    mul cx
+    mov cx, 2
+    div cx ; ax = index of entry in fat, dx = cluster % 2
+
+    mov si, buffer
+    add si, ax
+    mov ax, [ds:si]
+
+    or dx, dx
+    jz .even
+
+.odd:
+    shr ax, 4
+    jmp .next_cluster
+
+.even:
+    and ax, 0x0FFF
+
+.next_cluster:
+    cmp ax, 0x0FF8 ; end of chain
+    jae .read_done
+
+    mov [kernel_cluster], ax
+    jmp .load_kernel_loop
+
+.read_done:
+    ; jump to kernel
+    mov dl, [ebr_drive_number] ; boot device in dl
+    mov ax,  KERNEL_LOAD_SEGMENT ; set segment registers
+    mov ds, ax
+    mov es, ax
+    jmp KERNEL_LOAD_SEGMENT:KERNEL_LOAD_OFFSET
+
+    jmp wait_key_and_reboot
+
+    cli ; disable interrupts to ensure cpu can't get out of halt state
+    hlt
+
+floppy_error:
+    mov si, failed_read_message
+    call puts
+    jmp wait_key_and_reboot
+
+kernel_not_found_error:
+    mov si, kernel_not_found_message
+    call puts
+    jmp wait_key_and_reboot
+
+wait_key_and_reboot:
+    mov ah, 0
+    int 16h ; waits for keypress
+    jmp 0FFFFh:0 ; reboot (jump to beginning of bios)
+
+.halt:
+    cli ; disable interrupts to ensure cpu can't get out of halt state
+    hlt
+
 
 ;----------
 ; prints a string to the screen
@@ -56,44 +223,6 @@ puts:
     pop ax
     pop si
     ret
-
-main:
-    ; cannot write to ds and es directly
-    mov ax, 0
-    mov ds, ax
-    mov es, ax
-
-    ; setup stack that will grow down from loaded memory location as not to overwrite our program
-    mov ss, ax
-    mov sp, 0x7C00
-
-    ; read something from floppy disk (bios should set dl to drive number)
-    mov [ebr_drive_number], dl
-    mov ax, 1 ; lba = 1 (2nd sector from disk)
-    mov cl, 1 ; sectors to read
-    mov bx, 0x7E00 ; data should be after the bootloader
-    call read_sectors
-
-    ; print message to screen
-    mov si, new_message
-    call puts
-
-    cli ; disable interrupts to ensure cpu can't get out of halt state
-    hlt
-
-floppy_error:
-    mov si, failed_read_message
-    call puts
-    jmp wait_key_and_reboot
-
-wait_key_and_reboot:
-    mov ah, 0
-    int 16h ; waits for keypress
-    jmp 0FFFFh:0 ; reboot (jump to beginning of bios)
-
-.halt:
-    cli ; disable interrupts to ensure cpu can't get out of halt state
-    hlt
 
 ; disk routines
 
@@ -190,8 +319,16 @@ disk_reset:
     popa
     ret
 
-new_message: db 'Hello, world!', ENDLINE, 0
+loading_message: db 'Loading...', ENDLINE, 0
 failed_read_message: db 'Read from disk failed', ENDLINE, 0 
+kernel_not_found_message: db 'kernel.bin file not found', ENDLINE, 0 
+file_kernel_bin: db 'KERNEL  BIN'
+kernel_cluster: dw 0
+
+KERNEL_LOAD_SEGMENT: equ 0x2000
+KERNEL_LOAD_OFFSET: equ 0
 
 times 510-($-$$) db 0
 dw 0AA55h
+
+buffer:
